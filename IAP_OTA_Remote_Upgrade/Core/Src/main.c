@@ -29,6 +29,7 @@
 #include "flash_manage.h"
 #include "crc16.h"
 #include "protocol_handler.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +53,7 @@
 
 extern uint8_t g_uart_rx_byte;
 volatile uint8_t g_stay_in_bootloader = 0U;
+volatile uint8_t g_update_finish = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -258,11 +260,12 @@ int main(void)
         }
         HAL_Delay(1000);
     }
-		printf("    Jump to RunApp Start...\r\n");
+		
     
 		
 		
     if (!g_stay_in_bootloader) {
+				printf("    Jump to RunApp Start...\r\n");
 				// 先检查看是否选择了App区域 若选择了则检查RunApp是否有效
         if (param.run_app_status == APP_STATUS_VALID) {
             if (Boot_IsRunAppValid() == 0U) {
@@ -313,7 +316,15 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    //printf("    Stay in Bootloader permanent wait mode\r\n");
+    if (g_update_finish){
+				Param_Load(&param);
+				if (param.run_app_status == APP_STATUS_VALID){
+					Boot_JumpToRunApp();
+				}
+				else if (Boot_CopySelectedAppToRun()){
+					Boot_JumpToRunApp();
+				}
+		}
 	  HAL_Delay(5000);
   }
   /* USER CODE END 3 */

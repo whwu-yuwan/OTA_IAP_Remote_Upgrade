@@ -30,11 +30,11 @@ static uint32_t CalcCRC32(uint32_t *data, uint32_t len)
 uint32_t Flash_GetSector(uint32_t addr){
 	for (int i  = 0 ; i <= 11 ; i ++){
 		if (addr >= g_flash_sector_table[i].start_addr && addr <= (g_flash_sector_table[i].start_addr + g_flash_sector_table[i].size - 1) ){
-			printf("[Flash]经查找得到addr: %u  所处扇区为 Flash_Sector_%u \r\n" , addr , i);
+			//printf("[Flash]经查找得到addr: %u  所处扇区为 Flash_Sector_%u \r\n" , addr , i);
 			return g_flash_sector_table[i].sector_num;
 		}
 	}
-	printf("[Flash]查找失败, 返回默认扇区Flash_Sector_11");
+	//printf("[Flash]查找失败, 返回默认扇区Flash_Sector_11");
 	return g_flash_sector_table[11].sector_num; //默认返回扇区11
 }
 
@@ -57,10 +57,10 @@ uint8_t Flash_EraseSector(uint32_t Sector_Start , uint32_t Sector_End){
 	HAL_FLASH_Lock();
 	
 	if (status != HAL_OK) {
-		printf("[Flash] Erase failed! Error: 0x%u\r\n", sector_error);
+		//printf("[Flash] Erase failed! Error: 0x%u\r\n", sector_error);
 		return 1;
     }
-	printf("[Flash] Erase success!\r\n");
+	//printf("[Flash] Erase success!\r\n");
 	return 0;
 }
 
@@ -72,7 +72,7 @@ uint8_t Flash_Write(uint32_t addr, uint8_t *data, uint32_t len){
 	uint32_t *p_data =  (uint32_t *)data;
 	
 	if ((addr % 4) != 0){
-		printf("[Flash] Address not aligned: 0x%u\r\n", addr);
+		//printf("[Flash] Address not aligned: 0x%u\r\n", addr);
 		return 1;
 	}
 	
@@ -82,7 +82,7 @@ uint8_t Flash_Write(uint32_t addr, uint8_t *data, uint32_t len){
 	while(write_addr < addr_end){
 		status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, write_addr, *p_data);
 		if (status != HAL_OK){
-			printf("[Flash] Write failed at 0x%u\r\n", write_addr);
+			//printf("[Flash] Write failed at 0x%u\r\n", write_addr);
 			return 1;
 		}
 		write_addr += 4;
@@ -90,7 +90,7 @@ uint8_t Flash_Write(uint32_t addr, uint8_t *data, uint32_t len){
 	}
 	
 	HAL_FLASH_Lock();
-	printf("[Flash] write words success!\r\n");
+	//printf("[Flash] write words success!\r\n");
 	return 0;
 }
 
@@ -99,7 +99,7 @@ void Flash_Read(uint32_t addr, uint8_t *data, uint32_t len){
 	for (uint32_t i = 0 ; i < len ; i ++){
 		data[i] = *((uint8_t *)(addr)+ i);
 	}
-	printf("[Flash] Read Success");
+	//printf("[Flash] Read Success");
 }
 
 // 写入一个32位字
@@ -132,16 +132,16 @@ uint8_t Param_Save(FlashParam_t *param){
 	
 	ret = Flash_EraseSector(PARAM_SECTOR_START, PARAM_SECTOR_END);
 	if (ret == 1){
-		printf("[Flash] Param_Save Failed at Flash_Erase\r\n");
+		//printf("[Flash] Param_Save Failed at Flash_Erase\r\n");
 		return 1;
 	}
 
 	ret = Flash_Write(PARAM_SECTOR_START_ADDR, (uint8_t *)param, sizeof(FlashParam_t));
 	if (ret == 1){
-		printf("[Flash] Param_Save Failed at Flash_Write\r\n");
+		//printf("[Flash] Param_Save Failed at Flash_Write\r\n");
 		return 1;
 	}
-	printf("[Param] Param_Save success!\r\n");
+	//printf("[Param] Param_Save success!\r\n");
 	return 0;
 }
 
@@ -151,11 +151,11 @@ uint8_t Param_Load(FlashParam_t *param){
 	Flash_Read(PARAM_SECTOR_START_ADDR, (uint8_t *)param, sizeof(FlashParam_t));
 	crc32 = CalcCRC32((uint32_t *)param, (sizeof(FlashParam_t) - 4U)/4U);
 	if ((param->valid_flag == FLAG_VALID) && (param->crc32 == crc32)){
-		printf("[param] param load success\r\n");
+		//printf("[param] param load success\r\n");
 		return 0;
 	}
 	else{
-		printf("[param] param load fail\r\n");
+		//printf("[param] param load fail\r\n");
 		return 1;
 	}
 	
@@ -187,7 +187,7 @@ void Param_Init(FlashParam_t *param){
 	param->update_target = APP_AREA_NONE;
 	
 	param->crc32 = CalcCRC32((uint32_t *)param, (sizeof(FlashParam_t) - 4U)/4U);
-	printf("[param] param init success \r\n");
+	//printf("[param] param init success \r\n");
 }
 
 void Param_Print(FlashParam_t *param){

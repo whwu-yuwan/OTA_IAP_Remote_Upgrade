@@ -3,16 +3,19 @@
 #include "flash_manage.h"
 #include "protocol.h"
 #include "protocol_handler.h"
+#include "usart.h"
+#include "usart.h"
 
 // 协议接收缓冲区（全局，供中断使用）
 ProtocolRxBuffer_t g_protocol_rx_buf;
 extern volatile uint8_t g_stay_in_bootloader;
-
+extern volatile uint8_t g_update_finish;
 static uint8_t g_update_active = 0;          // 0=未升级 1=升级中
 static AppArea_t g_update_target = APP_AREA_NONE; // 当前目标区A/B
 static uint32_t g_update_addr = 0;           // 当前写入地址
 static uint32_t g_update_total = 0;          // 固件总长度
 static uint32_t g_update_recv = 0;           // 已接收长度
+static uint8_t g_uart_log_defer_enable = 0U;
 /* ==================== 命令处理注册表 ==================== */
 
 const CmdHandlerEntry_t g_cmd_handler_table[] = {
@@ -60,6 +63,11 @@ void Protocol_HandleFrame(ProtocolFrame_t *rx_frame){
 	if (!handle){
 		Protocol_CreateResponse(&tx_frame, CMD_NACK, NULL, 0);
 		Protocol_SendResponse(&tx_frame);
+	}
+
+	if (g_uart_log_defer_enable != 0U) {
+		UART_LogEnable(1U);
+		g_uart_log_defer_enable = 0U;
 	}
 }
 
@@ -212,7 +220,7 @@ void CMD_Handler_UpdateStart(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_fram
 	g_update_addr = (info.target == APP_AREA_A) ? APP_A_SECTOR_START_ADDR : APP_B_SECTOR_START_ADDR;		// 当前写入地址
 	g_update_total = info.size;          // 固件总长度
 	g_update_recv = 0;           // 已接收长度
-	
+	UART_LogEnable(0U);
     if (info.target == APP_AREA_A){
 		start_addr = Flash_GetSector(APP_A_SECTOR_START_ADDR);
 		end_addr  = Flash_GetSector(APP_A_SECTOR_START_ADDR + info.size - 1U);
@@ -283,10 +291,12 @@ void CMD_Handler_UpdateEnd(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame)
 	extern CRC_HandleTypeDef hcrc;
 	FlashParam_t param;
 	uint32_t crc;
+	g_uart_log_defer_enable = 1U;
 	if (Param_Load(&param)){
 		Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 		return;
 	}
+	
 	if (g_update_active != 1 || (g_update_recv != g_update_total)){
 		Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 		return;
@@ -327,6 +337,7 @@ void CMD_Handler_UpdateEnd(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame)
 		return;
 	}
 	g_update_active = 0;
+	g_update_finish = 1;
 	Protocol_CreateResponse(tx_frame, CMD_ACK, NULL, 0);
 }
 

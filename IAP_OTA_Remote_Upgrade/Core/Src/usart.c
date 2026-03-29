@@ -124,11 +124,21 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 #pragma import(__use_no_semihosting)                
 struct __FILE       { int handle; };     // 标准库需要的支持函数
 FILE __stdout;                           // FILE 在stdio.h文件
-void _sys_exit(int x) {	x = x; }         // 定义_sys_exit()以避免使用半主机模式
+void _sys_exit(int x) { x = x; }         // 定义_sys_exit()以避免使用半主机模式
+
+volatile uint8_t g_uart_log_enable = 1U;
+
+void UART_LogEnable(uint8_t enable)
+{
+  g_uart_log_enable = (enable != 0U) ? 1U : 0U;
+}
 
 //重定义fputc,用于串口打印调试
 int fputc(int ch, FILE *f)               
 {   
+  if (g_uart_log_enable == 0U) {
+    return ch;
+  }
   HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 500);
   return ch;
 }
