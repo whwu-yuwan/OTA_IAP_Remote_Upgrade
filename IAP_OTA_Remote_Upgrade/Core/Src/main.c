@@ -32,6 +32,7 @@
 #include "protocol_handler.h"
 #include "usart.h"
 #include "eth_tcp_server.h"
+#include "lwip/netif.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -182,6 +183,23 @@ static void Boot_JumpToRunApp(void)
 
     while (1) { }
 }
+
+extern struct netif gnetif;
+extern uint8_t IP_ADDRESS[4];
+extern uint8_t NETMASK_ADDRESS[4];
+extern uint8_t GATEWAY_ADDRESS[4];
+
+static void Print_NetInfo(void)
+{
+    printf(">>> NET:\r\n");
+    printf("    IP:      %u.%u.%u.%u\r\n", IP_ADDRESS[0], IP_ADDRESS[1], IP_ADDRESS[2], IP_ADDRESS[3]);
+    printf("    NETMASK: %u.%u.%u.%u\r\n", NETMASK_ADDRESS[0], NETMASK_ADDRESS[1], NETMASK_ADDRESS[2], NETMASK_ADDRESS[3]);
+    printf("    GATEWAY: %u.%u.%u.%u\r\n", GATEWAY_ADDRESS[0], GATEWAY_ADDRESS[1], GATEWAY_ADDRESS[2], GATEWAY_ADDRESS[3]);
+    printf("    MAC:     %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+           gnetif.hwaddr[0], gnetif.hwaddr[1], gnetif.hwaddr[2],
+           gnetif.hwaddr[3], gnetif.hwaddr[4], gnetif.hwaddr[5]);
+    printf("\r\n");
+}
 /* USER CODE END 0 */
 
 /**
@@ -218,8 +236,7 @@ int main(void)
   MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
     EthTcpServer_Init(5000, 0);
-    HAL_Delay(100);
-    
+    Print_NetInfo();
     printf("\r\n\r\n");
     printf("=========================================\r\n");
     printf("=      STM32F407 IAP/OTA Bootloader     =\r\n");
@@ -257,22 +274,18 @@ int main(void)
     printf("\r\n");
 
     printf(">>> Protocol Test Started...\r\n");
-    int count = 0;
-    for (int i = 0; i < 1000; i++) {
-        count++;
-        if (count % 500 == 0) {
-            printf("    Test %d...\r\n", （i + 1）/500);
-        }
+		
+    int tick = HAL_GetTick();
+    while((HAL_GetTick() - tick) < 10000) {
         if (g_stay_in_bootloader) {
           printf("    Stay in Bootloader permanent wait mode\r\n");
           break;
         }
         MX_LWIP_Process();
         EthTcpServer_Poll();
-        HAL_Delay(10);
     }
 		
-    if (!g_stay_in_bootloader) {
+    if (g_stay_in_bootloader) {
 				printf("    Jump to RunApp Start...\r\n");
 				// 先检查看是否选择了App区域 若选择了则检查RunApp是否有效
         if (param.run_app_status == APP_STATUS_VALID) {
@@ -313,8 +326,8 @@ int main(void)
     if (g_stay_in_bootloader) {
         printf("    Stay in Bootloader permanent wait mode\r\n");
     }
-    
 
+		printf("timeout");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -326,6 +339,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     MX_LWIP_Process();
     EthTcpServer_Poll();
+		
     if (g_update_finish){
 				Param_Load(&param);
 				if (param.run_app_status == APP_STATUS_VALID){
@@ -335,7 +349,6 @@ int main(void)
 					Boot_JumpToRunApp();
 				}
 		}
-	  HAL_Delay(5000);
   }
   /* USER CODE END 3 */
 }

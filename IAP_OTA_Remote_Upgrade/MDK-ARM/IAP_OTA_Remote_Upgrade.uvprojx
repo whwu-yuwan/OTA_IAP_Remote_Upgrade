@@ -434,6 +434,16 @@
               <FilePath>..\Core\Inc\protocol_handler.h</FilePath>
             </File>
             <File>
+              <FileName>eth_tcp_server.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\eth_tcp_server.c</FilePath>
+            </File>
+            <File>
+              <FileName>eth_tcp_server.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Inc\eth_tcp_server.h</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/main.c</FilePath>
@@ -620,16 +630,6 @@
               <FileName>stm32f4xx_hal_timebase_tim.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f4xx_hal_timebase_tim.c</FilePath>
-            </File>
-            <File>
-              <FileName>eth_tcp_server.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\eth_tcp_server.c</FilePath>
-            </File>
-            <File>
-              <FileName>eth_tcp_server.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\Core\Inc\eth_tcp_server.h</FilePath>
             </File>
           </Files>
         </Group>
