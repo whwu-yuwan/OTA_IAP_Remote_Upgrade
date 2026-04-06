@@ -69,17 +69,8 @@ static err_t EthTcp_OnRecv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_
         return ERR_OK;
     }
 
-    /*
-     * 通知 LwIP：我们已经“消费”了 tot_len 字节
-     * 否则 LwIP 认为窗口没腾出来，可能影响后续接收
-     */
     tcp_recved(tpcb, p->tot_len);
 
-    /*
-     * pbuf 可能是链表：逐段取 payload
-     * - 如果 g_on_bytes != NULL：交给上层处理（M3 之后）
-     * - 如果 g_on_bytes == NULL：默认回显（用于 M2 验收通道）
-     */
     for (struct pbuf *q = p; q != 0; q = q->next) {
         if (q->len > 0 && q->payload != 0) {
             if (g_on_bytes != 0) {

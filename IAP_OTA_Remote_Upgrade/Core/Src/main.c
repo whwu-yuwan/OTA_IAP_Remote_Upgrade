@@ -57,6 +57,9 @@
 extern uint8_t g_uart_rx_byte;
 volatile uint8_t g_stay_in_bootloader = 0U;
 volatile uint8_t g_update_finish = 0U;
+volatile UpdateMethod_t g_update_method = no_update; 
+static ProtocolRxBuffer_t g_eth_protocol_rx_buf;
+static uint8_t s_eth_prev_connected = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -65,6 +68,7 @@ void SystemClock_Config(void);
 static uint8_t Boot_CopySelectedAppToRun(void);
 static uint8_t Boot_IsRunAppValid(void);
 static void Boot_JumpToRunApp(void);
+static void Eth_OnBytes(const uint8_t *data, uint16_t len);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -183,7 +187,7 @@ static void Boot_JumpToRunApp(void)
 
     while (1) { }
 }
-
+/* 以太网接收回调 
 extern struct netif gnetif;
 extern uint8_t IP_ADDRESS[4];
 extern uint8_t NETMASK_ADDRESS[4];
@@ -200,6 +204,28 @@ static void Print_NetInfo(void)
            gnetif.hwaddr[3], gnetif.hwaddr[4], gnetif.hwaddr[5]);
     printf("\r\n");
 }
+*/
+
+  static void Eth_OnBytes(const uint8_t *data, uint16_t len)
+  {
+    if (data == NULL || len == 0U) {
+      return;
+    }
+
+    for (uint16_t i = 0; i < len; i++) {
+      uint8_t result = Protocol_ReceiveByte(&g_eth_protocol_rx_buf, data[i]);
+
+      if (result == 1U) {
+        ProtocolFrame_t frame;
+        if (Protocol_Unpack(g_eth_protocol_rx_buf.buffer, g_eth_protocol_rx_buf.index, &frame) == 0U) {
+          Protocol_HandleFrame(&frame, by_eth);
+        }
+        Protocol_InitRxBuffer(&g_eth_protocol_rx_buf);
+      } else if (result == 2U) {
+        Protocol_InitRxBuffer(&g_eth_protocol_rx_buf);
+      }
+    }
+  }
 /* USER CODE END 0 */
 
 /**
@@ -234,9 +260,11 @@ int main(void)
   MX_USART1_UART_Init();
   MX_CRC_Init();
   MX_LWIP_Init();
-  /* USER CODE BEGIN 2 */
-    EthTcpServer_Init(5000, 0);
-    Print_NetInfo();
+  /* USER CODE BEGIN 2 */  
+    Protocol_InitRxBuffer(&g_eth_protocol_rx_buf);
+    EthTcpServer_Init(5000, Eth_OnBytes);
+    s_eth_prev_connected = EthTcpServer_IsConnected();
+    // Print_NetInfo();
     printf("\r\n\r\n");
     printf("=========================================\r\n");
     printf("=      STM32F407 IAP/OTA Bootloader     =\r\n");
@@ -285,7 +313,7 @@ int main(void)
         EthTcpServer_Poll();
     }
 		
-    if (g_stay_in_bootloader) {
+    if (!g_stay_in_bootloader) {
 				printf("    Jump to RunApp Start...\r\n");
 				// 先检查看是否选择了App区域 若选择了则检查RunApp是否有效
         if (param.run_app_status == APP_STATUS_VALID) {
@@ -339,6 +367,14 @@ int main(void)
     /* USER CODE BEGIN 3 */
     MX_LWIP_Process();
     EthTcpServer_Poll();
+		
+    uint8_t eth_now_connected = EthTcpServer_IsConnected();
+    if ((s_eth_prev_connected == 1U) && (eth_now_connected == 0U)) {
+      Protocol_InitRxBuffer(&g_eth_protocol_rx_buf);
+      Protocol_Handler_OnTransportClosed(by_eth);
+      printf("[ETH] client disconnected, rx state reset\r\n");
+    }
+    s_eth_prev_connected = eth_now_connected;
 		
     if (g_update_finish){
 				Param_Load(&param);

@@ -6,6 +6,8 @@ using System.Drawing;
 using System.IO;
 using System.IO.Ports;
 using System.Linq;
+using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -28,8 +30,10 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             CMD_UPDATE_START = 0x0300,
             CMD_UPDATE_DATA = 0x0301,
             CMD_UPDATE_END = 0x0302,
+            CMD_UPDATE_ABORT = 0x0303,
             CMD_ACK = 0xFF00,
-            CMD_NACK = 0xFF01
+            CMD_NACK = 0xFF01,
+            CMD_BUSY = 0xFF02
         }
 
         private const int UpgradeChunkSize = 240; // UPDATE_DATA: 240字节数据，对应整帧252字节(240+12)
@@ -37,15 +41,72 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
         private const uint DefaultVersion = 1;
 
         private readonly SerialPort sp1 = new SerialPort();
+        private TcpClient _tcpClient;
         private readonly List<byte> _rxFrameBuffer = new List<byte>();
         private readonly object _rxLock = new object();
-        private readonly AutoResetEvent _ackEvent = new AutoResetEvent(false);
         private readonly Decoder _utf8Decoder = Encoding.UTF8.GetDecoder();
         private readonly StringBuilder _utf8RxBuffer = new StringBuilder();
         private readonly object _utf8LogLock = new object();
+        private readonly SemaphoreSlim _singleFlightLock = new SemaphoreSlim(1, 1);
+        private readonly AutoResetEvent _responseEvent = new AutoResetEvent(false);
+        private readonly object _sessionLock = new object();
+        private readonly object _transportLock = new object();
 
-        private volatile int _lastAckState = 0; // 1=ACK, -1=NACK, 0=未收到
         private bool _isUpgrading = false;
+        private bool _abortRequested = false;
+        private PendingCommandSession _pendingSession;
+        private NetworkStream _tcpStream;
+        private CancellationTokenSource _tcpReceiveCts;
+        private Task _tcpReceiveTask;
+        private TransportKind _activeTransport = TransportKind.None;
+
+        private enum CommandResultKind
+        {
+            None = 0,
+            Ack = 1,
+            Nack = 2,
+            Busy = 3,
+            Timeout = 4,
+            SendFailed = 5,
+            Aborted = 6,
+            Echo = 7
+        }
+
+        private enum TransportKind
+        {
+            None = 0,
+            Serial = 1,
+            Tcp = 2
+        }
+
+        private sealed class PendingCommandSession
+        {
+            public OtaCommand RequestCmd;
+            public bool ExpectEcho;
+            public int TimeoutMs;
+            public DateTime StartUtc;
+            public CommandResultKind Result;
+            public ushort ResponseCmd;
+            public byte[] ResponseData;
+        }
+
+        private sealed class CommandSessionResult
+        {
+            public CommandResultKind Result;
+            public ushort ResponseCmd;
+            public byte[] ResponseData;
+            public int BusyCount;
+            public int RetryCount;
+            public long ElapsedMs;
+
+            public bool IsAckLikeSuccess
+            {
+                get
+                {
+                    return Result == CommandResultKind.Ack || Result == CommandResultKind.Echo;
+                }
+            }
+        }
 
         public Form1()
         {
@@ -64,17 +125,21 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
 
         private void button4_Click(object sender, EventArgs e)
         {
-            SendProtocolData(OtaCommand.CMD_PING);
+            Task.Run(() =>
+            {
+                var result = SendCommandInSingleFlight(OtaCommand.CMD_PING, Encoding.ASCII.GetBytes("PING"), 2000, true, 0);
+                HandleSessionResult(OtaCommand.CMD_PING, result);
+            });
         }
 
         /// <summary>
-        /// 基于协议格式打包数据，并发送至串口
+        /// 基于协议格式打包数据，并发送到当前激活的传输通道（串口/TCP）
         /// </summary>
         private bool SendProtocolData(OtaCommand command, byte[] data = null)
         {
-            if (!sp1.IsOpen)
+            if (_activeTransport == TransportKind.None)
             {
-                MessageBox.Show("请先打开串口！");
+                AppendLog("[ERR] 请先打开串口或连接TCP！", Color.Red);
                 return false;
             }
 
@@ -82,19 +147,227 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             {
                 byte[] packet = BuildFrame(command, data);
 
-                // 发送数据
-                sp1.Write(packet, 0, packet.Length);
+                if (_activeTransport == TransportKind.Serial)
+                {
+                    if (!sp1.IsOpen)
+                    {
+                        AppendLog("[ERR] 串口未打开", Color.Red);
+                        return false;
+                    }
+
+                    sp1.Write(packet, 0, packet.Length);
+                }
+                else if (_activeTransport == TransportKind.Tcp)
+                {
+                    lock (_transportLock)
+                    {
+                        if (_tcpStream == null || _tcpClient == null || !_tcpClient.Connected)
+                        {
+                            AppendLog("[ERR] TCP未连接", Color.Red);
+                            return false;
+                        }
+
+                        _tcpStream.Write(packet, 0, packet.Length);
+                        _tcpStream.Flush();
+                    }
+                }
+                else
+                {
+                    AppendLog("[ERR] 未知传输通道", Color.Red);
+                    return false;
+                }
 
                 // 发送日志：显示命令和长度（不显示HEX）
                 int dataLen = data == null ? 0 : data.Length;
-                AppendLog($"[TX] {command}, Length={dataLen}", Color.Blue);
+                AppendLog($"[TX-{_activeTransport}] {command}, Length={dataLen}", Color.Blue);
 
                 return true;
             }
             catch (Exception ex)
             {
-                MessageBox.Show("发送数据失败: " + ex.Message);
+                AppendLog("[ERR] 发送数据失败: " + ex.Message, Color.Red);
                 return false;
+            }
+        }
+
+        private void ProcessIncomingBytes(byte[] buffer)
+        {
+            if (buffer == null || buffer.Length == 0)
+            {
+                return;
+            }
+
+            // 升级期间屏蔽UTF-8日志解析，避免ASCII日志与二进制帧混流时干扰观察
+            if (!_isUpgrading)
+            {
+                AppendUtf8LinesFromBytes(buffer);
+            }
+
+            // 追加到接收缓存并解析完整帧
+            lock (_rxLock)
+            {
+                _rxFrameBuffer.AddRange(buffer);
+                ParseReceivedFrames();
+            }
+        }
+
+        private void StartTcpReceiveLoop()
+        {
+            StopTcpReceiveLoop();
+            _tcpReceiveCts = new CancellationTokenSource();
+            var token = _tcpReceiveCts.Token;
+            _tcpReceiveTask = Task.Run(() => TcpReceiveLoop(token), token);
+        }
+
+        private void StopTcpReceiveLoop()
+        {
+            try
+            {
+                if (_tcpReceiveCts != null)
+                {
+                    _tcpReceiveCts.Cancel();
+                }
+            }
+            catch { }
+        }
+
+        private void CloseTcpTransport()
+        {
+            try { StopTcpReceiveLoop(); } catch { }
+
+            lock (_transportLock)
+            {
+                try
+                {
+                    if (_tcpStream != null)
+                    {
+                        _tcpStream.Close();
+                        _tcpStream = null;
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    if (_tcpClient != null)
+                    {
+                        _tcpClient.Close();
+                        _tcpClient = null;
+                    }
+                }
+                catch { }
+            }
+
+            _tcpStream = null;
+            _tcpReceiveTask = null;
+            _tcpReceiveCts = null;
+
+            if (_activeTransport == TransportKind.Tcp)
+            {
+                _activeTransport = TransportKind.None;
+            }
+        }
+
+        private void OpenTcpTransport(string host, int port)
+        {
+            lock (_transportLock)
+            {
+                if (_tcpClient != null && _tcpClient.Connected)
+                {
+                    CloseTcpTransport();
+                }
+
+                _tcpClient = new TcpClient();
+                _tcpClient.Connect(host, port);
+                _tcpStream = _tcpClient.GetStream();
+                // 不对读超时做强制断链；lwIP端可能在空闲时不立即回包
+                _tcpStream.ReadTimeout = Timeout.Infinite;
+                _tcpStream.WriteTimeout = 3000;
+            }
+
+            _activeTransport = TransportKind.Tcp;
+            StartTcpReceiveLoop();
+        }
+
+        private void TcpReceiveLoop(CancellationToken token)
+        {
+            byte[] buffer = new byte[4096];
+
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    NetworkStream stream;
+                    lock (_transportLock)
+                    {
+                        stream = _tcpStream;
+                    }
+
+                    if (stream == null)
+                    {
+                        break;
+                    }
+
+                    int read = stream.Read(buffer, 0, buffer.Length);
+                    if (read <= 0)
+                    {
+                        break;
+                    }
+
+                    byte[] chunk = new byte[read];
+                    Buffer.BlockCopy(buffer, 0, chunk, 0, read);
+                    ProcessIncomingBytes(chunk);
+                }
+            }
+            catch (IOException ex)
+            {
+                // 读超时/暂时无数据不应视为断链
+                var sockEx = ex.InnerException as SocketException;
+                if (sockEx != null)
+                {
+                    if (sockEx.SocketErrorCode == SocketError.TimedOut || sockEx.SocketErrorCode == SocketError.WouldBlock)
+                    {
+                        return;
+                    }
+                }
+
+                if (!token.IsCancellationRequested)
+                {
+                    AppendLog("[TCP] 接收线程退出: " + ex.Message, Color.DarkOrange);
+                }
+            }
+            catch (SocketException ex)
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    if (ex.SocketErrorCode != SocketError.TimedOut && ex.SocketErrorCode != SocketError.WouldBlock)
+                    {
+                        AppendLog("[TCP] 接收线程退出: " + ex.Message, Color.DarkOrange);
+                    }
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // 正常关闭流程
+            }
+            catch (Exception ex)
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    AppendLog("[TCP] 接收线程退出: " + ex.Message, Color.DarkOrange);
+                }
+            }
+            finally
+            {
+                if (_activeTransport == TransportKind.Tcp)
+                {
+                    AppendLog("[TCP] 连接已断开", Color.DarkOrange);
+                    _activeTransport = TransportKind.None;
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        button1.Text = "连接/断开";
+                    }));
+                }
             }
         }
 
@@ -200,40 +473,246 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             return aligned;
         }
 
-        private void ResetAckState()
+        private int GetBackoffDelayMs(int attemptIndex, int minDelayMs, int maxDelayMs)
         {
-            _lastAckState = 0;
-            while (_ackEvent.WaitOne(0)) { }
+            if (attemptIndex <= 0)
+            {
+                return minDelayMs;
+            }
+
+            int delay = minDelayMs + attemptIndex * 50;
+            return Math.Min(delay, maxDelayMs);
         }
 
-        private bool SendAndWaitAck(OtaCommand cmd, byte[] data, int timeoutMs)
+        private CommandSessionResult SendCommandInSingleFlight(
+            OtaCommand cmd,
+            byte[] data,
+            int timeoutMs,
+            bool expectEcho = false,
+            int maxBusyRetry = 0,
+            int busyMinDelayMs = 100,
+            int busyMaxDelayMs = 500)
         {
-            ResetAckState();
-
-            if (!SendProtocolData(cmd, data))
+            var result = new CommandSessionResult
             {
+                Result = CommandResultKind.None,
+                ResponseData = new byte[0]
+            };
+
+            _singleFlightLock.Wait();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                int busyCount = 0;
+                int retryCount = 0;
+
+                for (int attempt = 0; attempt <= maxBusyRetry; attempt++)
+                {
+                    while (_responseEvent.WaitOne(0)) { }
+
+                    var pending = new PendingCommandSession
+                    {
+                        RequestCmd = cmd,
+                        ExpectEcho = expectEcho,
+                        TimeoutMs = timeoutMs,
+                        StartUtc = DateTime.UtcNow,
+                        Result = CommandResultKind.None,
+                        ResponseData = new byte[0]
+                    };
+
+                    lock (_sessionLock)
+                    {
+                        _pendingSession = pending;
+                    }
+
+                    if (!SendProtocolData(cmd, data))
+                    {
+                        lock (_sessionLock)
+                        {
+                            _pendingSession = null;
+                        }
+
+                        result.Result = CommandResultKind.SendFailed;
+                        break;
+                    }
+
+                    bool signaled = false;
+                    int waited = 0;
+                    const int slice = 50;
+                    while (waited < timeoutMs)
+                    {
+                        if (_abortRequested && cmd != OtaCommand.CMD_UPDATE_ABORT)
+                        {
+                            lock (_sessionLock)
+                            {
+                                _pendingSession = null;
+                            }
+
+                            result.Result = CommandResultKind.Aborted;
+                            result.BusyCount = busyCount;
+                            result.RetryCount = retryCount;
+                            result.ElapsedMs = sw.ElapsedMilliseconds;
+                            return result;
+                        }
+
+                        int waitMs = Math.Min(slice, timeoutMs - waited);
+                        if (_responseEvent.WaitOne(waitMs))
+                        {
+                            signaled = true;
+                            break;
+                        }
+
+                        waited += waitMs;
+                    }
+
+                    PendingCommandSession finished;
+                    lock (_sessionLock)
+                    {
+                        finished = _pendingSession;
+                        _pendingSession = null;
+                    }
+
+                    if (!signaled || finished == null || finished.Result == CommandResultKind.None)
+                    {
+                        result.Result = CommandResultKind.Timeout;
+                        break;
+                    }
+
+                    result.Result = finished.Result;
+                    result.ResponseCmd = finished.ResponseCmd;
+                    result.ResponseData = finished.ResponseData ?? new byte[0];
+
+                    if (finished.Result == CommandResultKind.Busy)
+                    {
+                        busyCount++;
+                        if (attempt < maxBusyRetry)
+                        {
+                            retryCount++;
+                            int delayMs = GetBackoffDelayMs(attempt, busyMinDelayMs, busyMaxDelayMs);
+                            AppendLog($"[协议] {cmd} 收到 BUSY，{delayMs}ms 后退避重试({retryCount}/{maxBusyRetry})", Color.DarkOrange);
+                            Thread.Sleep(delayMs);
+                            continue;
+                        }
+                    }
+
+                    break;
+                }
+
+                result.BusyCount = busyCount;
+                result.RetryCount = retryCount;
+                result.ElapsedMs = sw.ElapsedMilliseconds;
+                return result;
+            }
+            finally
+            {
+                _singleFlightLock.Release();
+            }
+        }
+
+        private bool HandleSessionResult(OtaCommand cmd, CommandSessionResult result)
+        {
+            if (result == null)
+            {
+                AppendLog($"[ERR] {cmd} 无结果", Color.Red);
                 return false;
             }
 
-            if (!_ackEvent.WaitOne(timeoutMs))
+            if (result.IsAckLikeSuccess)
             {
-                AppendLog($"[ERR] 等待 {cmd} ACK 超时({timeoutMs}ms)", Color.Red);
+                return true;
+            }
+
+            if (result.Result == CommandResultKind.Busy)
+            {
+                AppendLog($"[ERR] {cmd} 收到 BUSY，重试已达上限", Color.Red);
                 return false;
             }
 
-            if (_lastAckState != 1)
+            if (result.Result == CommandResultKind.Nack)
             {
                 AppendLog($"[ERR] {cmd} 收到 NACK", Color.Red);
                 return false;
             }
 
-            return true;
+            if (result.Result == CommandResultKind.Timeout)
+            {
+                AppendLog($"[ERR] 等待 {cmd} 响应超时", Color.Red);
+                return false;
+            }
+
+            if (result.Result == CommandResultKind.Aborted)
+            {
+                AppendLog($"[ERR] {cmd} 被本地 ABORT 中断", Color.OrangeRed);
+                return false;
+            }
+
+            AppendLog($"[ERR] {cmd} 失败, Result={result.Result}", Color.Red);
+            return false;
+        }
+
+        private void SetUpgradeIdleImmediately(string reason)
+        {
+            _abortRequested = true;
+            _isUpgrading = false;
+            this.BeginInvoke(new Action(() =>
+            {
+                button5.Enabled = true;
+            }));
+
+            AppendLog("[UPG-ABORT] 本地会话已回到 idle: " + reason, Color.DarkOrange);
+        }
+
+        private void SendAbortNow(string reason)
+        {
+            if (_activeTransport == TransportKind.None)
+            {
+                AppendLog("[UPG-ABORT] 当前无可用通道，无法发送 ABORT", Color.Red);
+                return;
+            }
+
+            SetUpgradeIdleImmediately(reason);
+
+            Task.Run(() =>
+            {
+                var abortResult = SendCommandInSingleFlight(OtaCommand.CMD_UPDATE_ABORT, null, 3000, false, 10, 100, 500);
+
+                if (abortResult.Result == CommandResultKind.Ack)
+                {
+                    AppendLog("[UPG-ABORT] 设备返回 ACK，升级会话已中止", Color.DarkGreen);
+                }
+                else if (abortResult.Result == CommandResultKind.Nack)
+                {
+                    AppendLog("[UPG-ABORT] 设备返回 NACK（可能未处于升级态）", Color.OrangeRed);
+                }
+                else if (abortResult.Result == CommandResultKind.Busy)
+                {
+                    AppendLog("[UPG-ABORT] 设备返回 BUSY（通道占用）", Color.DarkOrange);
+                }
+                else if (abortResult.Result == CommandResultKind.Timeout)
+                {
+                    AppendLog("[UPG-ABORT] 等待设备响应超时", Color.Red);
+                }
+                else
+                {
+                    AppendLog("[UPG-ABORT] 发送失败: " + abortResult.Result, Color.Red);
+                }
+            });
         }
 
         private bool RunUpgrade(string filePath, uint targetArea)
         {
+            bool startAcked = false;
+            int totalPackets = 0;
+            int busyTimes = 0;
+            int retryTimes = 0;
+            int failedPacket = -1;
+            string failedReason = "-";
+            Stopwatch totalSw = Stopwatch.StartNew();
+
             try
             {
+                _abortRequested = false;
+
                 byte[] raw = File.ReadAllBytes(filePath);
                 byte[] aligned = PadTo4Bytes(raw);
                 uint crc32 = CalculateCrc32Stm(aligned);
@@ -258,20 +737,46 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
                 startData.AddRange(BitConverter.GetBytes((uint)aligned.Length));
                 startData.AddRange(BitConverter.GetBytes(crc32));
 
-                if (!SendAndWaitAck(OtaCommand.CMD_UPDATE_START, startData.ToArray(), 8000))
+                var startResult = SendCommandInSingleFlight(OtaCommand.CMD_UPDATE_START, startData.ToArray(), 8000, false, 10, 100, 500);
+                busyTimes += startResult.BusyCount;
+                retryTimes += startResult.RetryCount;
+                if (!HandleSessionResult(OtaCommand.CMD_UPDATE_START, startResult))
                 {
+                    failedReason = "START失败:" + startResult.Result;
                     return false;
                 }
+                startAcked = true;
 
                 int sent = 0;
+                int packetIndex = 0;
                 while (sent < aligned.Length)
                 {
+                    if (_abortRequested)
+                    {
+                        failedReason = "用户触发ABORT";
+                        return false;
+                    }
+
                     int len = Math.Min(UpgradeChunkSize, aligned.Length - sent);
                     byte[] chunk = new byte[len];
                     Buffer.BlockCopy(aligned, sent, chunk, 0, len);
 
-                    if (!SendAndWaitAck(OtaCommand.CMD_UPDATE_DATA, chunk, 2000))
+                    packetIndex++;
+                    totalPackets++;
+                    Stopwatch pktSw = Stopwatch.StartNew();
+                    var dataResult = SendCommandInSingleFlight(OtaCommand.CMD_UPDATE_DATA, chunk, 2000, false, 10, 100, 500);
+                    pktSw.Stop();
+
+                    busyTimes += dataResult.BusyCount;
+                    retryTimes += dataResult.RetryCount;
+                    string pktResultText = dataResult.Result.ToString().ToUpperInvariant();
+                    AppendLog($"[UPG-PKT] #{packetIndex}, Len={len}, Cost={pktSw.ElapsedMilliseconds}ms, Result={pktResultText}, Busy={dataResult.BusyCount}, Retry={dataResult.RetryCount}",
+                        dataResult.IsAckLikeSuccess ? Color.DarkGreen : Color.Red);
+
+                    if (!HandleSessionResult(OtaCommand.CMD_UPDATE_DATA, dataResult))
                     {
+                        failedPacket = packetIndex;
+                        failedReason = "DATA失败:" + dataResult.Result;
                         return false;
                     }
 
@@ -282,8 +787,12 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
                     }));
                 }
 
-                if (!SendAndWaitAck(OtaCommand.CMD_UPDATE_END, null, 5000))
+                var endResult = SendCommandInSingleFlight(OtaCommand.CMD_UPDATE_END, null, 5000, false, 10, 100, 500);
+                busyTimes += endResult.BusyCount;
+                retryTimes += endResult.RetryCount;
+                if (!HandleSessionResult(OtaCommand.CMD_UPDATE_END, endResult))
                 {
+                    failedReason = "END失败:" + endResult.Result;
                     return false;
                 }
 
@@ -292,8 +801,19 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             }
             catch (Exception ex)
             {
+                failedReason = "异常:" + ex.Message;
                 AppendLog("[ERR] 升级异常: " + ex.Message, Color.Red);
                 return false;
+            }
+            finally
+            {
+                totalSw.Stop();
+                AppendLog($"[UPG-SUM] TotalPkt={totalPackets}, Busy={busyTimes}, Retry={retryTimes}, TotalCost={totalSw.ElapsedMilliseconds}ms, FailPkt={(failedPacket < 0 ? "-" : failedPacket.ToString())}, Reason={failedReason}", Color.DarkBlue);
+
+                if (!string.Equals(failedReason, "-", StringComparison.Ordinal) && startAcked && !_abortRequested)
+                {
+                    SendAbortNow("升级失败自动ABORT");
+                }
             }
         }
 
@@ -359,6 +879,11 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
         {
             try
             {
+                if (_activeTransport == TransportKind.Tcp)
+                {
+                    CloseTcpTransport();
+                }
+
                 if (!sp1.IsOpen)
                 {
                     sp1.PortName = comboBox2.Text;
@@ -370,17 +895,56 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
                     sp1.Encoding = Encoding.UTF8;
 
                     sp1.Open();
+                    _activeTransport = TransportKind.Serial;
                     button2.Text = "关闭串口";
+                    AppendLog("[SERIAL] 串口已打开，当前通道=UART", Color.DarkGreen);
                 }
                 else
                 {
                     sp1.Close();
+                    if (_activeTransport == TransportKind.Serial)
+                    {
+                        _activeTransport = TransportKind.None;
+                    }
                     button2.Text = "打开串口";
+                    AppendLog("[SERIAL] 串口已关闭", Color.DarkOrange);
                 }
             }
             catch (Exception ex)
             {
                 MessageBox.Show("串口操作失败： " + ex.Message);
+            }
+        }
+
+        private void button1_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (_activeTransport == TransportKind.Tcp)
+                {
+                    CloseTcpTransport();
+                    button1.Text = "连接/断开";
+                    return;
+                }
+
+                if (sp1.IsOpen)
+                {
+                    sp1.Close();
+                    button2.Text = "打开串口";
+                }
+
+                string host = textBox1.Text.Trim();
+                int port = int.Parse(textBox2.Text.Trim());
+
+                OpenTcpTransport(host, port);
+                button1.Text = "断开TCP";
+                AppendLog($"[TCP] 已连接 {host}:{port}", Color.DarkGreen);
+            }
+            catch (Exception ex)
+            {
+                AppendLog("[TCP] 连接失败: " + ex.Message, Color.Red);
+                CloseTcpTransport();
+                button1.Text = "连接/断开";
             }
         }
 
@@ -409,6 +973,11 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             comboBox1.SelectedIndex = 0;
 
             comboBox2.Items.AddRange(SerialPort.GetPortNames());
+
+            textBox1.Text = "127.0.0.1";
+            textBox2.Text = "5000";
+
+            button1.Click += button1_Click;
 
             // 绑定非升级指令到 comboBox3
             comboBox3.Items.AddRange(new string[]
@@ -448,15 +1017,7 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             byte[] buffer = new byte[bytesToRead];
             sp1.Read(buffer, 0, bytesToRead);
 
-            // UTF-8日志（按行输出，避免被拆段）
-            AppendUtf8LinesFromBytes(buffer);
-
-            // 追加到接收缓存并解析完整帧
-            lock (_rxLock)
-            {
-                _rxFrameBuffer.AddRange(buffer);
-                ParseReceivedFrames();
-            }
+            ProcessIncomingBytes(buffer);
         }
 
         private void AppendUtf8LinesFromBytes(byte[] data)
@@ -563,19 +1124,111 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
                 }
 
                 ushort cmd = BitConverter.ToUInt16(frame, 2);
+                byte[] data = len > 0 ? frame.Skip(6).Take(len).ToArray() : new byte[0];
+
+                bool matchedPending = false;
+                PendingCommandSession pending;
+                lock (_sessionLock)
+                {
+                    pending = _pendingSession;
+                    if (pending != null)
+                    {
+                        TimeSpan age = DateTime.UtcNow - pending.StartUtc;
+                        bool inWindow = age.TotalMilliseconds >= 0 && age.TotalMilliseconds <= pending.TimeoutMs + 200;
+                        bool cmdMatched = cmd == (ushort)OtaCommand.CMD_ACK
+                            || cmd == (ushort)OtaCommand.CMD_NACK
+                            || cmd == (ushort)OtaCommand.CMD_BUSY
+                            || (pending.ExpectEcho && cmd == (ushort)pending.RequestCmd);
+
+                        if (inWindow && cmdMatched)
+                        {
+                            matchedPending = true;
+                            pending.ResponseCmd = cmd;
+                            pending.ResponseData = data;
+
+                            if (cmd == (ushort)OtaCommand.CMD_ACK)
+                            {
+                                pending.Result = CommandResultKind.Ack;
+                            }
+                            else if (cmd == (ushort)OtaCommand.CMD_NACK)
+                            {
+                                pending.Result = CommandResultKind.Nack;
+                            }
+                            else if (cmd == (ushort)OtaCommand.CMD_BUSY)
+                            {
+                                pending.Result = CommandResultKind.Busy;
+                            }
+                            else
+                            {
+                                pending.Result = CommandResultKind.Echo;
+                            }
+
+                            _responseEvent.Set();
+                        }
+                    }
+                }
+
                 if (cmd == (ushort)OtaCommand.CMD_ACK)
                 {
                     AppendLog("[协议] 收到 ACK（成功应答）", Color.DarkGreen);
-                    _lastAckState = 1;
-                    _ackEvent.Set();
+                    TryParseAckData(data);
                 }
                 else if (cmd == (ushort)OtaCommand.CMD_NACK)
                 {
                     AppendLog("[协议] 收到 NACK（失败应答）", Color.OrangeRed);
-                    _lastAckState = -1;
-                    _ackEvent.Set();
+                }
+                else if (cmd == (ushort)OtaCommand.CMD_BUSY)
+                {
+                    AppendLog("[协议] 收到 BUSY（设备忙/会话被占用）", Color.DarkOrange);
+                }
+                else if (cmd == (ushort)OtaCommand.CMD_PING)
+                {
+                    string pingText = ToUtf8Display(data);
+                    AppendLog($"[协议] PING回显, Length={data.Length}, Data='{pingText}'", Color.DarkCyan);
+                }
+                else
+                {
+                    AppendLog($"[协议] 收到 Cmd=0x{cmd:X4}, Length={len}", Color.Gray);
+                }
+
+                if (!matchedPending && pending != null && (cmd == (ushort)OtaCommand.CMD_ACK || cmd == (ushort)OtaCommand.CMD_NACK || cmd == (ushort)OtaCommand.CMD_BUSY))
+                {
+                    AppendLog("[协议] 忽略未匹配当前会话窗口的应答帧", Color.Gray);
                 }
             }
+        }
+
+        private void TryParseAckData(byte[] data)
+        {
+            if (data == null || data.Length == 0)
+            {
+                return;
+            }
+
+            // VersionInfo_t: 4 + 4 + 4 + 12 = 24
+            if (data.Length == 24)
+            {
+                uint bootVersion = BitConverter.ToUInt32(data, 0);
+                uint appVersion = BitConverter.ToUInt32(data, 4);
+                uint hwVersion = BitConverter.ToUInt32(data, 8);
+                string buildDate = Encoding.ASCII.GetString(data, 12, 12).TrimEnd('\0', ' ');
+                AppendLog($"[ACK-VER] boot={bootVersion}, app={appVersion}, hw={hwVersion}, build='{buildDate}'", Color.DarkSlateBlue);
+                return;
+            }
+
+            // ParamSummary_t(packed): 4 + 4 + 4 + 1 + 1 = 14
+            if (data.Length == 14)
+            {
+                uint bootVersion = BitConverter.ToUInt32(data, 0);
+                uint bootRunCount = BitConverter.ToUInt32(data, 4);
+                uint runAppVersion = BitConverter.ToUInt32(data, 8);
+                byte appAStatus = data[12];
+                byte appBStatus = data[13];
+                AppendLog($"[ACK-PARAM] boot={bootVersion}, runCnt={bootRunCount}, runApp={runAppVersion}, A={appAStatus}, B={appBStatus}", Color.DarkSlateBlue);
+                return;
+            }
+
+            AppendLog($"[ACK-DATA] Length={data.Length}", Color.DarkSlateBlue);
         }
 
         private string ToUtf8Display(byte[] data)
@@ -622,27 +1275,35 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
 
         private void button7_Click_2(object sender, EventArgs e)
         {
-
+            SendAbortNow("用户点击中止");
         }
 
         private void button7_Click_3(object sender, EventArgs e)
         {
-            if (comboBox3.SelectedIndex == 0)
+            int selectedIndex = comboBox3.SelectedIndex;
+            Task.Run(() =>
             {
-                SendProtocolData(OtaCommand.CMD_PING);
-            }
-            else if (comboBox3.SelectedIndex == 1)
-            {
-                SendProtocolData(OtaCommand.CMD_RESET);
-            }
-            else if (comboBox3.SelectedIndex == 2)
-            {
-                SendProtocolData(OtaCommand.CMD_GET_VERSION);
-            }
-            else if (comboBox3.SelectedIndex == 3)
-            {
-                SendProtocolData(OtaCommand.CMD_PARAM_READ);
-            }
+                if (selectedIndex == 0)
+                {
+                    var ping = SendCommandInSingleFlight(OtaCommand.CMD_PING, Encoding.ASCII.GetBytes("PING"), 2000, true, 0);
+                    HandleSessionResult(OtaCommand.CMD_PING, ping);
+                }
+                else if (selectedIndex == 1)
+                {
+                    var reset = SendCommandInSingleFlight(OtaCommand.CMD_RESET, null, 2000, false, 0);
+                    HandleSessionResult(OtaCommand.CMD_RESET, reset);
+                }
+                else if (selectedIndex == 2)
+                {
+                    var ver = SendCommandInSingleFlight(OtaCommand.CMD_GET_VERSION, null, 2000, false, 0);
+                    HandleSessionResult(OtaCommand.CMD_GET_VERSION, ver);
+                }
+                else if (selectedIndex == 3)
+                {
+                    var param = SendCommandInSingleFlight(OtaCommand.CMD_PARAM_READ, null, 2000, false, 0);
+                    HandleSessionResult(OtaCommand.CMD_PARAM_READ, param);
+                }
+            });
         }
 
         private async void button5_Click(object sender, EventArgs e)
@@ -653,9 +1314,9 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
                 return;
             }
 
-            if (!sp1.IsOpen)
+            if (_activeTransport == TransportKind.None)
             {
-                MessageBox.Show("请先打开串口。");
+                MessageBox.Show("请先打开串口或连接TCP。");
                 return;
             }
 
@@ -668,6 +1329,7 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             uint targetArea = GetSelectedTargetArea();
 
             _isUpgrading = true;
+            _abortRequested = false;
             button5.Enabled = false;
 
             bool ok = await Task.Run(() => RunUpgrade(textBox3.Text, targetArea));
@@ -676,6 +1338,16 @@ namespace IAP_OTA_Remote_Upgrade_UpperComputer
             button5.Enabled = true;
 
             MessageBox.Show(ok ? "升级成功" : "升级失败，请查看日志");
+
+            if (ok)
+            {
+                await Task.Delay(200);
+                await Task.Run(() =>
+                {
+                    var resetResult = SendCommandInSingleFlight(OtaCommand.CMD_RESET, null, 2000, false, 0);
+                    HandleSessionResult(OtaCommand.CMD_RESET, resetResult);
+                });
+            }
        
         }
 

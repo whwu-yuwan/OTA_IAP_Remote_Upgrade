@@ -47,8 +47,16 @@ typedef enum {
     // 响应命令（0xFFxx）
     CMD_ACK             = 0xFF00,   // 应答（成功）
     CMD_NACK            = 0xFF01,   // 应答（失败）
+    CMD_BUSY            = 0xFF02,   // 设备忙（会话被占用）
     
 } ProtocolCmd_t;
+
+typedef enum {
+    no_update = 0,
+    by_uart,
+    by_eth ,
+    by_wifi 
+} UpdateMethod_t;
 
 /* ==================== 数据结构 ==================== */
 typedef struct{

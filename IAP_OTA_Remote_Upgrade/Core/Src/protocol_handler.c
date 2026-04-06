@@ -5,10 +5,12 @@
 #include "protocol_handler.h"
 #include "usart.h"
 #include "usart.h"
+#include "eth_tcp_server.h"
 
 // 协议接收缓冲区（全局，供中断使用）
 ProtocolRxBuffer_t g_protocol_rx_buf;
 extern volatile uint8_t g_stay_in_bootloader;
+extern volatile UpdateMethod_t g_update_method;
 
 static uint8_t g_update_active = 0;          // 0=未升级 1=升级中
 static AppArea_t g_update_target = APP_AREA_NONE; // 当前目标区A/B
@@ -16,6 +18,32 @@ static uint32_t g_update_addr = 0;           // 当前写入地址
 static uint32_t g_update_total = 0;          // 固件总长度
 static uint32_t g_update_recv = 0;           // 已接收长度
 static uint8_t g_uart_log_defer_enable = 0U;
+static UpdateMethod_t g_current_source = no_update;
+static UpdateMethod_t g_update_source = no_update;
+
+static void UpdateSessionReset(void)
+{
+	g_update_active = 0U;
+	g_update_source = no_update;
+	g_update_target = APP_AREA_NONE;
+	g_update_addr = 0U;
+	g_update_total = 0U;
+	g_update_recv = 0U;
+	g_update_method = no_update;
+}
+// 传输通道关闭回调（如TCP断开），如果正在升级且来源匹配则重置升级状态
+void Protocol_Handler_OnTransportClosed(UpdateMethod_t source)
+{
+	if (source == no_update) {
+		return;
+	}
+
+	if (g_update_active == 1U && g_update_source == source) {
+		UpdateSessionReset();
+		UART_LogEnable(1U);
+		g_uart_log_defer_enable = 0U;
+	}
+}
 /* ==================== 命令处理注册表 ==================== */
 
 const CmdHandlerEntry_t g_cmd_handler_table[] = {
@@ -46,15 +74,16 @@ void Protocol_Handler_Init(void){
     }
 }
 
-void Protocol_HandleFrame(ProtocolFrame_t *rx_frame){
+void Protocol_HandleFrame(ProtocolFrame_t *rx_frame, UpdateMethod_t source){
 	ProtocolFrame_t tx_frame;
 	uint8_t handle = 0;
 	g_stay_in_bootloader = 1;
+	g_current_source = source;
 	
 	for(int i = 0 ; i < CMD_HANDLER_COUNT ; i ++){
 		if (rx_frame->cmd == g_cmd_handler_table[i].cmd){
 			g_cmd_handler_table[i].handler(rx_frame, &tx_frame);
-			Protocol_SendResponse(&tx_frame);
+			Protocol_SendResponse(&tx_frame, source);
 			handle = 1;
 			break;
 		}
@@ -62,7 +91,7 @@ void Protocol_HandleFrame(ProtocolFrame_t *rx_frame){
 	
 	if (!handle){
 		Protocol_CreateResponse(&tx_frame, CMD_NACK, NULL, 0);
-		Protocol_SendResponse(&tx_frame);
+		Protocol_SendResponse(&tx_frame, source);
 	}
 
 	if (g_uart_log_defer_enable != 0U) {
@@ -71,7 +100,7 @@ void Protocol_HandleFrame(ProtocolFrame_t *rx_frame){
 	}
 }
 
-void Protocol_SendResponse(ProtocolFrame_t *frame){
+void Protocol_SendResponse(ProtocolFrame_t *frame, UpdateMethod_t source){
 	uint8_t tx_buffer[300];
 	uint8_t len;
 	extern UART_HandleTypeDef huart1;
@@ -79,8 +108,19 @@ void Protocol_SendResponse(ProtocolFrame_t *frame){
 	len = Protocol_Pack(frame, tx_buffer, sizeof(tx_buffer));
 	
 	if (len > 0){
-		HAL_UART_Transmit(&huart1, tx_buffer, len, 1000);
-		printf("[protocol] send data: 0x%04X (%d bytes)\r\n", frame->cmd, len);
+		/* 根据通道来源选择发送方式 */
+		if (source == by_eth) {
+			/* ETH 通道：通过 TCP 发送 */
+			if (EthTcpServer_Send(tx_buffer, len) == 0U) {
+				printf("[protocol] ETH send data: 0x%04X (%d bytes)\r\n", frame->cmd, len);
+			} else {
+				printf("[protocol] ETH send failed\r\n");
+			}
+		} else {
+			/* UART 或其他通道：通过串口发送 */
+			HAL_UART_Transmit(&huart1, tx_buffer, len, 1000);
+			printf("[protocol] UART send data: 0x%04X (%d bytes)\r\n", frame->cmd, len);
+		}
 	}
 	else {
 		printf("[protocol] ProtocolPack failed\r\n");
@@ -133,7 +173,7 @@ void CMD_Handler_Reset(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame){
 	printf("[CMD] reset command receive\r\n");
 	
 	Protocol_CreateResponse(tx_frame, CMD_ACK, NULL, 0);
-	Protocol_SendResponse(tx_frame);
+	Protocol_SendResponse(tx_frame, g_current_source);
 	
 	HAL_Delay(1000);
 	NVIC_SystemReset();
@@ -199,7 +239,17 @@ void CMD_Handler_UpdateStart(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_fram
 	FlashParam_t param;
 	uint32_t start_addr;
 	uint32_t end_addr;
-	
+
+	if (g_update_active == 1U) {
+		Protocol_CreateResponse(tx_frame, CMD_BUSY, NULL, 0);
+		return;
+	}
+
+	if (g_update_source != no_update && g_update_source != g_current_source) {
+		Protocol_CreateResponse(tx_frame, CMD_BUSY, NULL, 0);
+		return;
+	}
+
 	if (rx_frame->length < sizeof(UpdateStartInfo_t)){
 		Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 		return;
@@ -214,6 +264,9 @@ void CMD_Handler_UpdateStart(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_fram
 		Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 		return;
 	}
+
+	g_update_source = g_current_source;
+	g_update_method = g_current_source;
 	
 	g_update_active = 1;          // 0=未升级 1=升级中
 	g_update_target = info.target; // 当前目标区A/B
@@ -232,7 +285,7 @@ void CMD_Handler_UpdateStart(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_fram
 	}
 	
 	if (Flash_EraseSector(start_addr, end_addr) != 0U){
-		g_update_active = 0;
+		UpdateSessionReset();
 		Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 		return;
 	}
@@ -262,6 +315,12 @@ void CMD_Handler_UpdateStart(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_fram
 }
 
 void CMD_Handler_UpdateData(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame){
+	if (g_update_source != g_current_source)
+	{
+		Protocol_CreateResponse(tx_frame, CMD_BUSY, NULL, 0);
+		return;
+	}
+	
 	//判断更新在进行
 	if (g_update_active != 1){
 		Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
@@ -289,6 +348,12 @@ void CMD_Handler_UpdateData(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame
 }
 
 void CMD_Handler_UpdateEnd(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame){
+	if (g_update_source != g_current_source)
+	{
+		Protocol_CreateResponse(tx_frame, CMD_BUSY, NULL, 0);
+		return;
+	}
+	
 	extern CRC_HandleTypeDef hcrc;
 	FlashParam_t param;
 	uint32_t crc;
@@ -310,6 +375,7 @@ void CMD_Handler_UpdateEnd(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame)
 			Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 			param.app_a_status = APP_STATUS_INVALID;
             Param_Save(&param);
+			UpdateSessionReset();
 			return;
 		}
 		param.app_a_status = APP_STATUS_VALID;
@@ -322,6 +388,7 @@ void CMD_Handler_UpdateEnd(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame)
 			Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 			param.app_b_status = APP_STATUS_INVALID;
             Param_Save(&param);
+			UpdateSessionReset();
 			return;
 		}
 		param.app_b_status = APP_STATUS_VALID;
@@ -337,7 +404,7 @@ void CMD_Handler_UpdateEnd(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame)
 		Protocol_CreateResponse(tx_frame, CMD_NACK, NULL, 0);
 		return;
 	}
-	g_update_active = 0;
+	UpdateSessionReset();
 	Protocol_CreateResponse(tx_frame, CMD_ACK, NULL, 0);
 }
 

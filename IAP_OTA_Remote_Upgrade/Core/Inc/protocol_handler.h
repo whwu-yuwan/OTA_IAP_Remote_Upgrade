@@ -25,13 +25,13 @@ void Protocol_Handler_Init(void);
  * @brief  处理接收到的协议帧
  * @param  rx_frame: 接收到的帧
  */
-void Protocol_HandleFrame(ProtocolFrame_t *rx_frame);
+void Protocol_HandleFrame(ProtocolFrame_t *rx_frame, UpdateMethod_t source);
 
 /**
  * @brief  发送响应帧
  * @param  frame: 要发送的帧
  */
-void Protocol_SendResponse(ProtocolFrame_t *frame);
+void Protocol_SendResponse(ProtocolFrame_t *frame, UpdateMethod_t source);
 
 /* ==================== 具体命令处理函数 ==================== */
 
@@ -63,5 +63,7 @@ void CMD_Handler_ParamWrite(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame
 void CMD_Handler_UpdateStart(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame);
 void CMD_Handler_UpdateData(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame);
 void CMD_Handler_UpdateEnd(ProtocolFrame_t *rx_frame, ProtocolFrame_t *tx_frame);
+
+void Protocol_Handler_OnTransportClosed(UpdateMethod_t source);
 
 #endif
