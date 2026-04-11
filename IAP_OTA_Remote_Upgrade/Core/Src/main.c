@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "crc.h"
+#include "dma.h"
 #include "lwip.h"
 #include "usart.h"
 #include "gpio.h"
@@ -298,10 +299,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_CRC_Init();
   MX_LWIP_Init();
-  /* USER CODE BEGIN 2 */  
+  MX_USART3_UART_Init();
+  /* USER CODE BEGIN 2 */
     Protocol_InitRxBuffer(&g_eth_protocol_rx_buf);
     EthTcpServer_Init(5000, Eth_OnBytes);
     s_eth_prev_connected = EthTcpServer_IsConnected();
